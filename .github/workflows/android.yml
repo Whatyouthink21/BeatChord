@@ -3,10 +3,24 @@ name: Android Release APK
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      variant:
+        description: "Build variant"
+        required: false
+        default: "prodRelease"
+        type: choice
+        options:
+          - prodRelease
+          - devDebug
+          - devRelease
+          - prodDebug
 
 jobs:
-  build-prod-release:
+  build:
+    name: Android · ${{ inputs.variant || 'prodRelease' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -18,38 +32,149 @@ jobs:
       with:
         java-version: '17'
         distribution: 'temurin'
-        cache: gradle
+
+    # Gradle caching + build-scan support. Mirrors what check.yml already does
+    # for the dev-debug job so the release build benefits from the same cache.
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v4
+
+    # Expose the SDK path and the sdkmanager binary for the steps below.
+    # The GitHub runner ships the command-line tools in a couple of possible
+    # places depending on image version, so discover the binary rather than
+    # hard-coding one path.
+    - name: Locate Android SDK
+      id: sdk
+      shell: bash
+      run: |
+        for candidate in "$ANDROID_SDK_ROOT" "$ANDROID_HOME" /usr/local/lib/android/sdk "$HOME/Android/Sdk"; do
+          if [ -n "$candidate" ] && [ -d "$candidate" ]; then
+            SDK="$candidate"
+            break
+          fi
+        done
+        echo "sdk=$SDK" >> "$GITHUB_OUTPUT"
+
+        for b in "$SDK/cmdline-tools/latest/bin/sdkmanager" \
+                 "$SDK/cmdline-tools/bin/sdkmanager" \
+                 "$SDK/tools/bin/sdkmanager"; do
+          if [ -x "$b" ]; then echo "sdkmanager=$b" >> "$GITHUB_OUTPUT"; echo "sdkmanager found: $b"; break; fi
+        done
+
+    # The android-37 platform (and anything else compileSdk pulls in) is too
+    # new for the cmdline-tools baked into the runner image; sdkmanager on the
+    # host returns "Failed to find package 'platforms;android-37'". AGP auto-
+    # downloads missing SDK components at build time as long as (a) licenses
+    # are pre-accepted and (b) android.builder.sdkDownload=true, which is how
+    # the check.yml Android job already builds devDebug successfully. So we
+    # don't run sdkmanager --install for platforms/build-tools here — we just
+    # accept the licenses (creating the directory if needed) and let AGP do
+    # the rest. CMake and the NDK are pinned in the build files and are also
+    # auto-provisioned by AGP when externalNativeBuild runs.
+    - name: Accept Android SDK licenses
+      shell: bash
+      run: |
+        SDK="${{ steps.sdk.outputs.sdk }}"
+        mkdir -p "$SDK/licenses"
+        yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+        # Pre-seed every license hash AGP checks for, including the NDK, CMake
+        # and preview-license files. The runner's sdkmanager is too old to know
+        # about android-37 / NDK 27 packages, so it can't accept their licenses
+        # interactively; writing the accepted-hash file directly is what AGP
+        # itself looks for.
+        printf "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$SDK/licenses/android-sdk-license"
+        printf "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$SDK/licenses/android-sdk-preview-license"
+        printf "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$SDK/licenses/intel-android-extra-license"
+        printf "\n504667f4c0de7af1a06de9f4b1727b84351f2910" > "$SDK/licenses/android-googletv-license"
+        printf "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$SDK/licenses/google-gdk-license"
+        printf "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$SDK/licenses/mips-android-sysimage-license"
+        # NDK + CMake share the android-sdk-license hash, but older AGP
+        # releases also look for these aliases:
+        cp "$SDK/licenses/android-sdk-license" "$SDK/licenses/android-sdk-arm-dbt-license" 2>/dev/null || true
+        ls -la "$SDK/licenses"
 
     - name: Setup Secrets (Keystore & local.properties)
+      shell: bash
       run: |
-        echo "LASTFM_API_KEY=${{ secrets.LASTFM_API_KEY }}" > local.properties
-        echo "LASTFM_SECRET=${{ secrets.LASTFM_SECRET }}" >> local.properties
-
-        echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > bitchord-release.jks
+        SDK="${{ steps.sdk.outputs.sdk }}"
+        # local.properties: tell Gradle where the SDK is, and pass through the
+        # optional API keys. Keys that aren't set in the repo's secrets come
+        # through empty, which is fine (see app/build.gradle.kts — empty is a
+        # supported state, not a broken build).
         {
-          echo "storeFile=bitchord-release.jks"
-          echo "storePassword=${{ secrets.KEYSTORE_PASSWORD }}"
-          echo "keyAlias=${{ secrets.KEY_ALIAS }}"
-          echo "keyPassword=${{ secrets.KEY_PASSWORD }}"
-        } > keystore.properties
+          echo "sdk.dir=$SDK"
+          echo "LASTFM_API_KEY=${{ secrets.LASTFM_API_KEY }}"
+          echo "LASTFM_SECRET=${{ secrets.LASTFM_SECRET }}"
+          echo "LISTEN_TOGETHER_SERVER=${{ secrets.LISTEN_TOGETHER_SERVER }}"
+        } > local.properties
+
+        # Release signing is optional. If KEYSTORE_BASE64 is not set (e.g. on a
+        # PR from a fork, where GitHub withholds secrets), skip it — the build
+        # then produces unsigned APKs rather than failing. app/build.gradle.kts
+        # is written for exactly this case.
+        if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > bitchord-release.jks
+          {
+            echo "storeFile=bitchord-release.jks"
+            echo "storePassword=${{ secrets.KEYSTORE_PASSWORD }}"
+            echo "keyAlias=${{ secrets.KEY_ALIAS }}"
+            echo "keyPassword=${{ secrets.KEY_PASSWORD }}"
+          } > keystore.properties
+          echo "Keystore written — will produce signed APKs."
+        else
+          echo "No keystore secret present — producing unsigned APKs."
+        fi
 
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
 
-    - name: Build Signed Prod Release APK
-      run: ./gradlew assembleProdRelease
+    - name: Build APK (${{ inputs.variant || 'prodRelease' }})
+      shell: bash
+      run: |
+        # Give the Gradle daemon a little more headroom for the release variant
+        # (R8 + Compose + the native CMake build all run in one process).
+        # android.builder.sdkDownload=true tells AGP it may auto-download any
+        # missing SDK/NDK/CMake components at build time — that is how check.yml's
+        # android job gets android-36 without an explicit sdkmanager step, and
+        # how we get android-37 past the runner's outdated cmdline-tools.
+        export GRADLE_OPTS="-Xmx4096m -Dfile.encoding=UTF-8"
+        ./gradlew assemble${{ inputs.variant || 'prodRelease' }} \
+          -Pandroid.builder.sdkDownload=true \
+          --stacktrace
 
-    - name: Upload APK Artifact
+    - name: Determine variant paths
+      id: paths
+      shell: bash
+      run: |
+        variant="${{ inputs.variant || 'prodRelease' }}"
+        # prodRelease -> flavor=prod, type=release; devDebug -> dev/debug, etc.
+        flavor=$(echo "$variant" | sed -E 's/^(prod|dev)(Debug|Release|Benchmark)$/\1/')
+        type=$(echo "$variant" | sed -E 's/^(prod|dev)(Debug|Release|Benchmark)$/\L\2/')
+        echo "flavor=$flavor" >> "$GITHUB_OUTPUT"
+        echo "type=$type" >> "$GITHUB_OUTPUT"
+        echo "--- Phone APKs ---"
+        ls -la "app/build/outputs/apk/$flavor/$type/" || true
+        echo "--- Wear APKs ---"
+        ls -la "wearos/build/outputs/apk/$flavor/$type/" || true
+
+    - name: Upload Phone APKs
       uses: actions/upload-artifact@v4
       with:
-        name: bitchord-prod-release-signed
-        path: app/build/outputs/apk/prod/release/*.apk
+        name: bitchord-phone-${{ inputs.variant || 'prodRelease' }}
+        path: app/build/outputs/apk/${{ steps.paths.outputs.flavor }}/${{ steps.paths.outputs.type }}/*.apk
 
-    # Built by the same assembleProdRelease, with the same key. The watch app
-    # only pairs with a phone app signed by the same key, so a prod watch APK
-    # for these phone builds can only come from here, never a local build.
-    - name: Upload Wear OS APK Artifact
+    - name: Upload Wear OS APKs
+      if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: bitchord-wear-prod-release-signed
-        path: wearos/build/outputs/apk/prod/release/*.apk
+        name: bitchord-wear-${{ inputs.variant || 'prodRelease' }}
+        path: wearos/build/outputs/apk/${{ steps.paths.outputs.flavor }}/${{ steps.paths.outputs.type }}/*.apk
+
+    - name: Upload build reports on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: android-build-reports
+        path: |
+          app/build/reports/
+          wearos/build/reports/
+          */build/outputs/logs/
