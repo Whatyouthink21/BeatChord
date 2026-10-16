@@ -60,28 +60,37 @@ jobs:
           if [ -x "$b" ]; then echo "sdkmanager=$b" >> "$GITHUB_OUTPUT"; echo "sdkmanager found: $b"; break; fi
         done
 
-    # AGP will not download SDK components unless the licenses are pre-accepted
-    # on the machine; without this step the first build on a fresh runner fails
-    # with "Failed to install the following Android SDK packages".
+    # The android-37 platform (and anything else compileSdk pulls in) is too
+    # new for the cmdline-tools baked into the runner image; sdkmanager on the
+    # host returns "Failed to find package 'platforms;android-37'". AGP auto-
+    # downloads missing SDK components at build time as long as (a) licenses
+    # are pre-accepted and (b) android.builder.sdkDownload=true, which is how
+    # the check.yml Android job already builds devDebug successfully. So we
+    # don't run sdkmanager --install for platforms/build-tools here — we just
+    # accept the licenses (creating the directory if needed) and let AGP do
+    # the rest. CMake and the NDK are pinned in the build files and are also
+    # auto-provisioned by AGP when externalNativeBuild runs.
     - name: Accept Android SDK licenses
       shell: bash
       run: |
-        yes | "${{ steps.sdk.outputs.sdkmanager }}" --licenses >/dev/null 2>&1 || true
-
-    # compileSdk 37, CMake 3.22.1 (for the native analyzer) and an NDK (for the
-    # C/C++ toolchain CMake needs) are not all present on every runner image.
-    # Install them explicitly so the build is reproducible.
-    - name: Install required Android SDK components
-      shell: bash
-      run: |
-        SM="${{ steps.sdk.outputs.sdkmanager }}"
-        "$SM" --install \
-          "platforms;android-37" \
-          "platforms;android-36" \
-          "build-tools;36.0.0" \
-          "cmake;3.22.1" \
-          "ndk;27.0.12077973" \
-          "platform-tools"
+        SDK="${{ steps.sdk.outputs.sdk }}"
+        mkdir -p "$SDK/licenses"
+        yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+        # Pre-seed every license hash AGP checks for, including the NDK, CMake
+        # and preview-license files. The runner's sdkmanager is too old to know
+        # about android-37 / NDK 27 packages, so it can't accept their licenses
+        # interactively; writing the accepted-hash file directly is what AGP
+        # itself looks for.
+        printf "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$SDK/licenses/android-sdk-license"
+        printf "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$SDK/licenses/android-sdk-preview-license"
+        printf "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$SDK/licenses/intel-android-extra-license"
+        printf "\n504667f4c0de7af1a06de9f4b1727b84351f2910" > "$SDK/licenses/android-googletv-license"
+        printf "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$SDK/licenses/google-gdk-license"
+        printf "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$SDK/licenses/mips-android-sysimage-license"
+        # NDK + CMake share the android-sdk-license hash, but older AGP
+        # releases also look for these aliases:
+        cp "$SDK/licenses/android-sdk-license" "$SDK/licenses/android-sdk-arm-dbt-license" 2>/dev/null || true
+        ls -la "$SDK/licenses"
 
     - name: Setup Secrets (Keystore & local.properties)
       shell: bash
@@ -123,8 +132,14 @@ jobs:
       run: |
         # Give the Gradle daemon a little more headroom for the release variant
         # (R8 + Compose + the native CMake build all run in one process).
+        # android.builder.sdkDownload=true tells AGP it may auto-download any
+        # missing SDK/NDK/CMake components at build time — that is how check.yml's
+        # android job gets android-36 without an explicit sdkmanager step, and
+        # how we get android-37 past the runner's outdated cmdline-tools.
         export GRADLE_OPTS="-Xmx4096m -Dfile.encoding=UTF-8"
-        ./gradlew assemble${{ inputs.variant || 'prodRelease' }} --stacktrace
+        ./gradlew assemble${{ inputs.variant || 'prodRelease' }} \
+          -Pandroid.builder.sdkDownload=true \
+          --stacktrace
 
     - name: Determine variant paths
       id: paths
