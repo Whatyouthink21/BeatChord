@@ -4507,6 +4507,7 @@ private fun BitChordApp(
                 } else {
                     null
                 },
+                showTempoPitchControls = fromPlayer,
             )
         }
         songActions?.takeIf { songMenuOrigin == null }?.let { song ->
