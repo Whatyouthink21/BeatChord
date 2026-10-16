@@ -27,6 +27,7 @@ import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.automirrored.rounded.Undo
 import androidx.compose.material.icons.rounded.Album
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Check
@@ -41,8 +42,11 @@ import androidx.compose.material.icons.rounded.FileUpload
 import androidx.compose.material.icons.rounded.HighQuality
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Radio
+import androidx.compose.material.icons.rounded.Remove
 import androidx.compose.material.icons.rounded.PlaylistRemove
 import androidx.compose.material.icons.rounded.Share
+import androidx.compose.material.icons.rounded.Speed
+import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.ThumbDown
 import androidx.compose.material.icons.rounded.ThumbDownOffAlt
 import androidx.compose.material.icons.rounded.Tune
@@ -80,6 +84,7 @@ import com.music.bitchord.data.model.LikeStatus
 import com.music.bitchord.data.model.ROW_ART_PX
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.model.artworkAt
+import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.data.webdav.WebDavUploads
 import com.music.bitchord.download.DownloadState
 import com.music.bitchord.download.Downloads
@@ -91,6 +96,7 @@ import com.music.bitchord.ui.theme.rememberArtworkPalette
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.Locale
+import kotlin.math.roundToInt
 
 /**
  * Long-press menu for a track, in the shape music apps normally use.
@@ -178,6 +184,8 @@ fun SongActionsSheet(
     onCopyLog: (() -> Unit)? = null,
     /** Opens the timing control offered only by the main player's menu. */
     onLyricsOffset: (() -> Unit)? = null,
+    /** Shows the live tempo and pitch steppers in the player's track menu only. */
+    showTempoPitchControls: Boolean = false,
     /**
      * True while a lookup for this track's album/artist ids is still in
      * flight, so it isn't yet known whether "Open album" and "Open artist"
@@ -341,6 +349,43 @@ fun SongActionsSheet(
                 value = sleepTimerStatus(),
                 accent = palette.accent,
             ) { pickingSleepTimer = true }
+        }
+        if (showTempoPitchControls) {
+            GroupSeparator(palette)
+            val tempo by AppSettings.playbackSpeed.collectAsStateWithLifecycle()
+            val pitch by AppSettings.playbackPitch.collectAsStateWithLifecycle()
+            TempoPitchActionRow(
+                icon = Icons.Rounded.Speed,
+                label = stringResource(R.string.tempo),
+                value = String.format(Locale.ROOT, "%.2f×", tempo),
+                decreaseLabel = stringResource(R.string.tempo_decrease),
+                increaseLabel = stringResource(R.string.tempo_increase),
+                decreaseEnabled = tempo > 0.5f,
+                increaseEnabled = tempo < 2.0f,
+                accent = palette.accent,
+                onDecrease = {
+                    AppSettings.setPlaybackSpeed(
+                        (((tempo - 0.05f) * 100f).roundToInt() / 100f).coerceAtLeast(0.5f),
+                    )
+                },
+                onIncrease = {
+                    AppSettings.setPlaybackSpeed(
+                        (((tempo + 0.05f) * 100f).roundToInt() / 100f).coerceAtMost(2.0f),
+                    )
+                },
+            )
+            TempoPitchActionRow(
+                icon = Icons.Rounded.MusicNote,
+                label = stringResource(R.string.pitch),
+                value = pitch.roundToInt().let { if (it > 0) "+$it st" else "$it st" },
+                decreaseLabel = stringResource(R.string.pitch_decrease),
+                increaseLabel = stringResource(R.string.pitch_increase),
+                decreaseEnabled = pitch > -AppSettings.PITCH_LIMIT_SEMITONES,
+                increaseEnabled = pitch < AppSettings.PITCH_LIMIT_SEMITONES,
+                accent = palette.accent,
+                onDecrease = { AppSettings.setPlaybackPitch(pitch - 1f) },
+                onIncrease = { AppSettings.setPlaybackPitch(pitch + 1f) },
+            )
         }
         // Deliberately outside the online-only block below. Local files and
         // completed downloads use the same player lyric clock (including
@@ -506,6 +551,83 @@ private fun TintedSheet(
 }
 
 private val SHEET_SHAPE = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
+
+/**
+ * A compact live tempo/pitch stepper for the player's track menu. It uses the
+ * same fixed increments and bounds as Settings, but keeps the controls beside
+ * the current song actions instead of sending the listener out to Settings.
+ */
+@Composable
+private fun TempoPitchActionRow(
+    icon: ImageVector,
+    label: String,
+    value: String,
+    decreaseLabel: String,
+    increaseLabel: String,
+    decreaseEnabled: Boolean,
+    increaseEnabled: Boolean,
+    accent: Color,
+    onDecrease: () -> Unit,
+    onIncrease: () -> Unit,
+) {
+    val menu = LocalActionRowStyle.current == ActionRowStyle.Menu
+    val foreground = if (menu) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onBackground
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = if (menu) 48.dp else 58.dp)
+            .padding(horizontal = if (menu) 18.dp else 22.dp, vertical = if (menu) 4.dp else 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = foreground,
+            modifier = Modifier.size(if (menu) 20.dp else 22.dp),
+        )
+        Spacer(Modifier.width(if (menu) 14.dp else 18.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyLarge,
+            color = foreground,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        IconButton(
+            onClick = onDecrease,
+            enabled = decreaseEnabled,
+            modifier = Modifier.size(36.dp),
+        ) {
+            Icon(
+                Icons.Rounded.Remove,
+                contentDescription = decreaseLabel,
+                tint = accent.copy(alpha = if (decreaseEnabled) 1f else 0.35f),
+                modifier = Modifier.size(20.dp),
+            )
+        }
+        Text(
+            text = value,
+            style = MaterialTheme.typography.labelLarge,
+            color = foreground,
+            maxLines = 1,
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            modifier = Modifier.width(54.dp),
+        )
+        IconButton(
+            onClick = onIncrease,
+            enabled = increaseEnabled,
+            modifier = Modifier.size(36.dp),
+        ) {
+            Icon(
+                Icons.Rounded.Add,
+                contentDescription = increaseLabel,
+                tint = accent.copy(alpha = if (increaseEnabled) 1f else 0.35f),
+                modifier = Modifier.size(20.dp),
+            )
+        }
+    }
+}
 
 /**
  * One row carrying the whole life of a download: start it, watch it, cancel it,
